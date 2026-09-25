@@ -17,6 +17,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from key_rules import KeyRules
+from renewal import RenewalPolicy
+from renewal_store import CREDENTIALS_DDL, ONE_LIVE_CREDENTIAL_INDEX_DDL, RenewalStore
+
 DB_PATH = Path(__file__).with_name("data.db")
 
 
@@ -55,6 +59,7 @@ class Store:
         self.init_schema()
 
     def init_schema(self) -> None:
+        # credentials 与 one_live_credential 的定义由 renewal_store 统一维护。
         self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS key_versions (
@@ -78,24 +83,10 @@ class Store:
               created_at TEXT NOT NULL,
               UNIQUE(issuer, code)
             );
-            CREATE TABLE IF NOT EXISTS credentials (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              template_id INTEGER NOT NULL REFERENCES templates(id),
-              issuer TEXT NOT NULL,
-              holder_id TEXT NOT NULL,
-              claims_json TEXT NOT NULL,
-              issued_at TEXT NOT NULL,
-              valid_until TEXT NOT NULL,
-              status TEXT NOT NULL CHECK(status IN ('active','revoked','disputed')),
-              key_version INTEGER NOT NULL,
-              idempotency_key TEXT NOT NULL,
-              revocation_reason TEXT,
-              revocation_effective_at TEXT,
-              UNIQUE(template_id, holder_id, idempotency_key)
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS one_live_credential
-              ON credentials(template_id, holder_id)
-              WHERE status IN ('active','disputed');
+            """
+            + CREDENTIALS_DDL
+            + ONE_LIVE_CREDENTIAL_INDEX_DDL
+            + """
             CREATE TABLE IF NOT EXISTS disputes (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               credential_id INTEGER NOT NULL REFERENCES credentials(id),
@@ -135,6 +126,9 @@ class CredentialService:
     def __init__(self, store: Store):
         self.store = store
         self.conn = store.conn
+        self.renewals = RenewalStore(self.conn)
+        self.key_rules = KeyRules(self.conn)
+        self.renewal_policy = RenewalPolicy(self.key_rules)
 
     @staticmethod
     def _required_actor(actor: str | None, role: str | None, expected: str) -> str:
@@ -151,9 +145,7 @@ class CredentialService:
         return row
 
     def _active_key(self, issuer: str) -> sqlite3.Row:
-        row = self.conn.execute(
-            "SELECT * FROM key_versions WHERE issuer=? AND status='active' ORDER BY version DESC LIMIT 1", (issuer,)
-        ).fetchone()
+        row = self.key_rules.active_key(issuer)
         if not row:
             raise ApiError(409, "签发方尚未初始化密钥")
         return row
@@ -262,6 +254,72 @@ class CredentialService:
             self.store.audit(actor, "credential.revoke", "credential", credential_id, {"reason": reason, "effective_at": iso(effective)})
         return self._credential_dict(self._row("credentials", credential_id))
 
+    def renew(self, actor: str | None, role: str | None, credential_id: int) -> dict:
+        """密钥轮换后，由持有人或签发方为未过期且无争议的旧凭证换发新版本。
+
+        换发会写明旧凭证失效时间：截止前旧令牌显示待续签但仍可验证，截止后拒绝。
+        同一旧凭证重复申请沿用首次结果。
+        """
+        if not actor:
+            raise ApiError(401, "缺少身份")
+        credential = self._row("credentials", credential_id)
+        if role == "holder":
+            if credential["holder_id"] != actor:
+                raise ApiError(403, "只能续签自己的凭证")
+        elif role == "issuer":
+            if credential["issuer"] != actor:
+                raise ApiError(403, "只能续签本机构签发的凭证")
+        else:
+            raise ApiError(403, "需要角色 holder 或 issuer")
+        existing = self.renewals.find_by_old(credential_id)
+        if existing:
+            return self._renewal_result(existing, reused=True)
+        key = self.key_rules.key_version(credential["issuer"], credential["key_version"])
+        if not key:
+            raise ApiError(409, "无法找到签发密钥版本")
+        at = now()
+        blocker = self.renewal_policy.renewal_blocker(credential, key, at)
+        if blocker:
+            raise ApiError(blocker[0], blocker[1])
+        active_key = self._active_key(credential["issuer"])
+        invalid_at = self.renewal_policy.old_credential_invalid_at(credential, key)
+        try:
+            with self.conn:
+                # 先把旧凭证移出有效集合，再插入同模板同持有人的新凭证。
+                self.renewals.mark_superseded(credential_id, iso(invalid_at))
+                new_id = self.renewals.insert_successor(credential, active_key["version"], iso(at))
+                renewal_id = self.renewals.record(
+                    credential_id, new_id, actor, iso(at), iso(invalid_at),
+                    credential["key_version"], active_key["version"],
+                )
+                self.store.audit(actor, "credential.renew", "credential", credential_id, {
+                    "new_credential_id": new_id,
+                    "old_invalid_at": iso(invalid_at),
+                    "old_key_version": credential["key_version"],
+                    "new_key_version": active_key["version"],
+                })
+        except sqlite3.IntegrityError:
+            # 并发续签同一旧凭证：沿用首次结果。
+            existing = self.renewals.find_by_old(credential_id)
+            if existing:
+                return self._renewal_result(existing, reused=True)
+            raise ApiError(409, "续签冲突，请重试")
+        return self._renewal_result(self.renewals.find_by_id(renewal_id), reused=False)
+
+    def _renewal_result(self, renewal: sqlite3.Row, reused: bool) -> dict:
+        return {
+            "renewal_id": renewal["id"],
+            "old_credential_id": renewal["old_credential_id"],
+            "new_credential": self._credential_dict(self._row("credentials", renewal["new_credential_id"])),
+            "old_credential": self._credential_dict(self._row("credentials", renewal["old_credential_id"])),
+            "old_invalid_at": renewal["old_invalid_at"],
+            "old_key_version": renewal["old_key_version"],
+            "new_key_version": renewal["new_key_version"],
+            "requested_by": renewal["requested_by"],
+            "requested_at": renewal["requested_at"],
+            "reused": reused,
+        }
+
     def dispute(self, actor: str | None, role: str | None, credential_id: int, reason: str) -> dict:
         actor = self._required_actor(actor, role, "holder")
         credential = self._row("credentials", credential_id)
@@ -340,9 +398,7 @@ class CredentialService:
         except (ValueError, KeyError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ApiError(400, "凭证令牌格式错误") from exc
         credential = self._row("credentials", int(payload.get("credential_id", 0)))
-        key = self.conn.execute(
-            "SELECT * FROM key_versions WHERE issuer=? AND version=?", (credential["issuer"], credential["key_version"])
-        ).fetchone()
+        key = self.key_rules.key_version(credential["issuer"], credential["key_version"])
         if not key:
             raise ApiError(409, "无法找到签发密钥版本")
         expected = hmac.new(bytes.fromhex(key["secret_hex"]), canonical(payload), hashlib.sha256).hexdigest()
@@ -361,6 +417,15 @@ class CredentialService:
                 result.update(valid=False, status="revoked", reason=credential["revocation_reason"])
             else:
                 result.update(status="valid_until_revocation", revocation_starts_at=credential["revocation_effective_at"])
+        else:
+            # 轮换后的旧密钥凭证与已换发凭证的续签结论。
+            conclusion = self.renewal_policy.verification_conclusion(credential, key, check_at)
+            if conclusion:
+                result.update(conclusion)
+            if credential["status"] == "superseded":
+                renewal = self.renewals.find_by_old(credential["id"])
+                if renewal:
+                    result["renewed_by_credential_id"] = renewal["new_credential_id"]
         if not online:
             result["offline"] = True
             result["revocation_freshness"] = "needs_online_check"
@@ -374,14 +439,15 @@ class CredentialService:
             "id": row["id"], "template_id": row["template_id"], "issuer": row["issuer"], "holder_id": row["holder_id"],
             "claims": json.loads(row["claims_json"]), "issued_at": row["issued_at"], "valid_until": row["valid_until"],
             "status": row["status"], "key_version": row["key_version"], "revocation_reason": row["revocation_reason"],
-            "revocation_effective_at": row["revocation_effective_at"],
+            "revocation_effective_at": row["revocation_effective_at"], "renewal_invalid_at": row["renewal_invalid_at"],
         }
 
     def state(self) -> dict:
         credentials = [self._credential_dict(row) for row in self.conn.execute("SELECT * FROM credentials ORDER BY id DESC")]
         templates = [dict(row) for row in self.conn.execute("SELECT id,issuer,code,name,status,validity_days FROM templates ORDER BY id DESC")]
+        renewals = self.renewals.list_all()
         audits = [dict(row) for row in self.conn.execute("SELECT at,actor,action,entity_type,entity_id,details_json FROM audit_log ORDER BY id DESC LIMIT 30")]
-        return {"templates": templates, "credentials": credentials, "audits": audits}
+        return {"templates": templates, "credentials": credentials, "renewals": renewals, "audits": audits}
 
     def seed(self) -> None:
         if not self.conn.execute("SELECT id FROM key_versions LIMIT 1").fetchone():
@@ -450,6 +516,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.issue(actor, role, int(body.get("template_id", 0)), body.get("holder_id", ""), body.get("claims", {}), body.get("idempotency_key", ""), body.get("valid_until"))
             elif len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "revoke":
                 result = self.service.revoke(actor, role, int(parts[2]), body.get("reason", ""), body.get("effective_at"))
+            elif len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "renew":
+                result = self.service.renew(actor, role, int(parts[2]))
             elif len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "dispute":
                 result = self.service.dispute(actor, role, int(parts[2]), body.get("reason", ""))
             elif len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "present":
