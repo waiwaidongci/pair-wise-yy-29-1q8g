@@ -7,126 +7,17 @@ import base64
 import hashlib
 import hmac
 import json
-import os
-import secrets
 import sqlite3
 import sys
-import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
-DB_PATH = Path(__file__).with_name("data.db")
-
-
-def now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def iso(value: datetime | None = None) -> str:
-    return (value or now()).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def parse_time(value: str | None) -> datetime:
-    if not value:
-        return now()
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
-def canonical(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message)
-        self.status = status
-        self.message = message
-
-
-class Store:
-    def __init__(self, path: str | os.PathLike[str] = DB_PATH):
-        self.path = str(path)
-        self.conn = sqlite3.connect(self.path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.init_schema()
-
-    def init_schema(self) -> None:
-        self.conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS key_versions (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              issuer TEXT NOT NULL,
-              version INTEGER NOT NULL,
-              secret_hex TEXT NOT NULL,
-              status TEXT NOT NULL CHECK(status IN ('active','retired')),
-              created_at TEXT NOT NULL,
-              retired_at TEXT,
-              UNIQUE(issuer, version)
-            );
-            CREATE TABLE IF NOT EXISTS templates (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              issuer TEXT NOT NULL,
-              code TEXT NOT NULL,
-              name TEXT NOT NULL,
-              fields_json TEXT NOT NULL,
-              validity_days INTEGER NOT NULL CHECK(validity_days BETWEEN 1 AND 3650),
-              status TEXT NOT NULL CHECK(status IN ('active','disabled')),
-              created_at TEXT NOT NULL,
-              UNIQUE(issuer, code)
-            );
-            CREATE TABLE IF NOT EXISTS credentials (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              template_id INTEGER NOT NULL REFERENCES templates(id),
-              issuer TEXT NOT NULL,
-              holder_id TEXT NOT NULL,
-              claims_json TEXT NOT NULL,
-              issued_at TEXT NOT NULL,
-              valid_until TEXT NOT NULL,
-              status TEXT NOT NULL CHECK(status IN ('active','revoked','disputed')),
-              key_version INTEGER NOT NULL,
-              idempotency_key TEXT NOT NULL,
-              revocation_reason TEXT,
-              revocation_effective_at TEXT,
-              UNIQUE(template_id, holder_id, idempotency_key)
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS one_live_credential
-              ON credentials(template_id, holder_id)
-              WHERE status IN ('active','disputed');
-            CREATE TABLE IF NOT EXISTS disputes (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              credential_id INTEGER NOT NULL REFERENCES credentials(id),
-              raised_by TEXT NOT NULL,
-              reason TEXT NOT NULL,
-              status TEXT NOT NULL CHECK(status IN ('open','upheld','rejected')),
-              resolution TEXT,
-              created_at TEXT NOT NULL,
-              resolved_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS audit_log (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              at TEXT NOT NULL,
-              actor TEXT NOT NULL,
-              action TEXT NOT NULL,
-              entity_type TEXT NOT NULL,
-              entity_id TEXT NOT NULL,
-              details_json TEXT NOT NULL
-            );
-            """
-        )
-        self.conn.commit()
-
-    def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
-        self.conn.execute(
-            "INSERT INTO audit_log(at,actor,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?,?)",
-            (iso(), actor, action, entity_type, str(entity_id), json.dumps(details, ensure_ascii=False)),
-        )
-
-    def close(self) -> None:
-        self.conn.close()
+import keys
+import renewal
+from common import ApiError, canonical, iso, now, parse_time
+from store import DB_PATH, Store, credential_dict, get_row
 
 
 class CredentialService:
@@ -144,37 +35,11 @@ class CredentialService:
             raise ApiError(403, f"需要角色 {expected}")
         return actor
 
-    def _row(self, table: str, identity: int) -> sqlite3.Row:
-        row = self.conn.execute(f"SELECT * FROM {table} WHERE id=?", (identity,)).fetchone()
-        if not row:
-            raise ApiError(404, "对象不存在")
-        return row
-
-    def _active_key(self, issuer: str) -> sqlite3.Row:
-        row = self.conn.execute(
-            "SELECT * FROM key_versions WHERE issuer=? AND status='active' ORDER BY version DESC LIMIT 1", (issuer,)
-        ).fetchone()
-        if not row:
-            raise ApiError(409, "签发方尚未初始化密钥")
-        return row
-
     def rotate_key(self, actor: str | None, role: str | None, issuer: str) -> dict:
         actor = self._required_actor(actor, role, "issuer")
         if actor != issuer:
             raise ApiError(403, "只能轮换自己的密钥")
-        with self.conn:
-            old = self.conn.execute("SELECT * FROM key_versions WHERE issuer=? AND status='active'", (issuer,)).fetchone()
-            version = 1
-            if old:
-                version = int(old["version"]) + 1
-                self.conn.execute("UPDATE key_versions SET status='retired', retired_at=? WHERE id=?", (iso(), old["id"]))
-            secret_hex = secrets.token_hex(32)
-            cur = self.conn.execute(
-                "INSERT INTO key_versions(issuer,version,secret_hex,status,created_at) VALUES(?,?,?,'active',?)",
-                (issuer, version, secret_hex, iso()),
-            )
-            self.store.audit(actor, "key.rotate", "key_version", cur.lastrowid, {"version": version, "retired_previous": bool(old)})
-        return {"issuer": issuer, "version": version, "status": "active", "public_fingerprint": hashlib.sha256(secret_hex.encode()).hexdigest()[:20]}
+        return keys.rotate_key(self.store, actor, issuer)
 
     def create_template(self, actor: str | None, role: str | None, code: str, name: str, fields: list[dict], validity_days: int) -> dict:
         actor = self._required_actor(actor, role, "issuer")
@@ -205,7 +70,7 @@ class CredentialService:
         actor = self._required_actor(actor, role, "issuer")
         if not holder_id.strip() or not idempotency_key.strip():
             raise ApiError(400, "持有人和幂等键不能为空")
-        template = self._row("templates", template_id)
+        template = get_row(self.conn, "templates", template_id)
         if template["issuer"] != actor:
             raise ApiError(403, "不能使用其他签发方的模板")
         if template["status"] != "active":
@@ -215,7 +80,7 @@ class CredentialService:
             (template_id, holder_id, idempotency_key),
         ).fetchone()
         if existing:
-            return self._credential_dict(existing)
+            return credential_dict(existing)
         fields = json.loads(template["fields_json"])
         missing = [f["name"] for f in fields if f["required"] and not str(claims.get(f["name"], "")).strip()]
         unknown = sorted(set(claims) - {f["name"] for f in fields})
@@ -231,7 +96,7 @@ class CredentialService:
         expiration = parse_time(valid_until) if valid_until else issued + timedelta(days=int(template["validity_days"]))
         if expiration <= issued:
             raise ApiError(400, "有效期必须晚于签发时间")
-        key = self._active_key(actor)
+        key = keys.active_key(self.conn, actor)
         try:
             with self.conn:
                 cur = self.conn.execute(
@@ -242,16 +107,19 @@ class CredentialService:
                 self.store.audit(actor, "credential.issue", "credential", cur.lastrowid, {"holder_id": holder_id, "template_id": template_id, "key_version": key["version"]})
         except sqlite3.IntegrityError as exc:
             raise ApiError(409, "并发签发冲突，请用相同幂等键重试") from exc
-        return self._credential_dict(self._row("credentials", cur.lastrowid))
+        return credential_dict(get_row(self.conn, "credentials", cur.lastrowid))
+
+    def renew(self, actor: str | None, role: str | None, credential_id: int) -> dict:
+        return renewal.renew(self.store, actor, role, credential_id)
 
     def revoke(self, actor: str | None, role: str | None, credential_id: int, reason: str, effective_at: str | None = None) -> dict:
         actor = self._required_actor(actor, role, "issuer")
-        credential = self._row("credentials", credential_id)
+        credential = get_row(self.conn, "credentials", credential_id)
         if credential["issuer"] != actor:
             raise ApiError(403, "只能撤销本机构签发的凭证")
         if credential["status"] == "revoked":
             if credential["revocation_reason"] == reason:
-                return self._credential_dict(credential)
+                return credential_dict(credential)
             raise ApiError(409, "凭证已经撤销")
         effective = parse_time(effective_at) if effective_at else now()
         with self.conn:
@@ -260,11 +128,11 @@ class CredentialService:
                 (reason, iso(effective), credential_id),
             )
             self.store.audit(actor, "credential.revoke", "credential", credential_id, {"reason": reason, "effective_at": iso(effective)})
-        return self._credential_dict(self._row("credentials", credential_id))
+        return credential_dict(get_row(self.conn, "credentials", credential_id))
 
     def dispute(self, actor: str | None, role: str | None, credential_id: int, reason: str) -> dict:
         actor = self._required_actor(actor, role, "holder")
-        credential = self._row("credentials", credential_id)
+        credential = get_row(self.conn, "credentials", credential_id)
         if credential["holder_id"] != actor:
             raise ApiError(403, "只能对自己的凭证提出争议")
         if credential["status"] != "revoked":
@@ -285,10 +153,10 @@ class CredentialService:
         actor = self._required_actor(actor, role, "regulator")
         if decision not in {"uphold", "reject"}:
             raise ApiError(400, "决定只能是 uphold 或 reject")
-        dispute = self._row("disputes", dispute_id)
+        dispute = get_row(self.conn, "disputes", dispute_id)
         if dispute["status"] != "open":
             raise ApiError(409, "争议已经处理")
-        credential = self._row("credentials", dispute["credential_id"])
+        credential = get_row(self.conn, "credentials", dispute["credential_id"])
         if credential["status"] != "disputed":
             raise ApiError(409, "凭证状态与争议不一致")
         new_status = "revoked" if decision == "uphold" else "active"
@@ -301,10 +169,10 @@ class CredentialService:
 
     def present(self, actor: str | None, role: str | None, credential_id: int, disclosed_fields: list[str] | None) -> dict:
         actor = self._required_actor(actor, role, "holder")
-        credential = self._row("credentials", credential_id)
+        credential = get_row(self.conn, "credentials", credential_id)
         if credential["holder_id"] != actor:
             raise ApiError(403, "不能出示他人的凭证")
-        template = self._row("templates", credential["template_id"])
+        template = get_row(self.conn, "templates", credential["template_id"])
         allowed = [field["name"] for field in json.loads(template["fields_json"])]
         disclosed = disclosed_fields if disclosed_fields is not None else allowed
         if len(disclosed) != len(set(disclosed)) or any(name not in allowed for name in disclosed):
@@ -320,9 +188,9 @@ class CredentialService:
             "valid_until": credential["valid_until"],
             "key_version": credential["key_version"],
         }
-        key = self.conn.execute(
-            "SELECT secret_hex FROM key_versions WHERE issuer=? AND version=?", (credential["issuer"], credential["key_version"])
-        ).fetchone()
+        key = keys.key_version(self.conn, credential["issuer"], credential["key_version"])
+        if not key:
+            raise ApiError(409, "无法找到签发密钥版本")
         signature = hmac.new(bytes.fromhex(key["secret_hex"]), canonical(payload), hashlib.sha256).hexdigest()
         token = base64.urlsafe_b64encode(canonical({"payload": payload, "signature": signature})).decode().rstrip("=")
         self.store.audit(actor, "credential.present", "credential", credential_id, {"disclosed_fields": disclosed})
@@ -339,10 +207,8 @@ class CredentialService:
             supplied_signature = envelope["signature"]
         except (ValueError, KeyError, json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ApiError(400, "凭证令牌格式错误") from exc
-        credential = self._row("credentials", int(payload.get("credential_id", 0)))
-        key = self.conn.execute(
-            "SELECT * FROM key_versions WHERE issuer=? AND version=?", (credential["issuer"], credential["key_version"])
-        ).fetchone()
+        credential = get_row(self.conn, "credentials", int(payload.get("credential_id", 0)))
+        key = keys.key_version(self.conn, credential["issuer"], credential["key_version"])
         if not key:
             raise ApiError(409, "无法找到签发密钥版本")
         expected = hmac.new(bytes.fromhex(key["secret_hex"]), canonical(payload), hashlib.sha256).hexdigest()
@@ -361,27 +227,24 @@ class CredentialService:
                 result.update(valid=False, status="revoked", reason=credential["revocation_reason"])
             else:
                 result.update(status="valid_until_revocation", revocation_starts_at=credential["revocation_effective_at"])
+        else:
+            conclusion = renewal.status_conclusion(self.conn, credential, key, check_at)
+            if conclusion:
+                result.update(conclusion)
         if not online:
             result["offline"] = True
             result["revocation_freshness"] = "needs_online_check"
-            if result["valid"]:
+            if result["valid"] and result["status"] == "valid":
                 result["status"] = "valid_offline"
         self.conn.commit()
         return result
 
-    def _credential_dict(self, row: sqlite3.Row) -> dict:
-        return {
-            "id": row["id"], "template_id": row["template_id"], "issuer": row["issuer"], "holder_id": row["holder_id"],
-            "claims": json.loads(row["claims_json"]), "issued_at": row["issued_at"], "valid_until": row["valid_until"],
-            "status": row["status"], "key_version": row["key_version"], "revocation_reason": row["revocation_reason"],
-            "revocation_effective_at": row["revocation_effective_at"],
-        }
-
     def state(self) -> dict:
-        credentials = [self._credential_dict(row) for row in self.conn.execute("SELECT * FROM credentials ORDER BY id DESC")]
+        credentials = [credential_dict(row) for row in self.conn.execute("SELECT * FROM credentials ORDER BY id DESC")]
         templates = [dict(row) for row in self.conn.execute("SELECT id,issuer,code,name,status,validity_days FROM templates ORDER BY id DESC")]
+        renewals = [dict(row) for row in self.conn.execute("SELECT * FROM renewals ORDER BY id DESC")]
         audits = [dict(row) for row in self.conn.execute("SELECT at,actor,action,entity_type,entity_id,details_json FROM audit_log ORDER BY id DESC LIMIT 30")]
-        return {"templates": templates, "credentials": credentials, "audits": audits}
+        return {"templates": templates, "credentials": credentials, "renewals": renewals, "audits": audits}
 
     def seed(self) -> None:
         if not self.conn.execute("SELECT id FROM key_versions LIMIT 1").fetchone():
@@ -448,6 +311,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.service.create_template(actor, role, body.get("code", ""), body.get("name", ""), body.get("fields", []), int(body.get("validity_days", 1)))
             elif parts == ["api", "credentials"]:
                 result = self.service.issue(actor, role, int(body.get("template_id", 0)), body.get("holder_id", ""), body.get("claims", {}), body.get("idempotency_key", ""), body.get("valid_until"))
+            elif len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "renew":
+                result = self.service.renew(actor, role, int(parts[2]))
             elif len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "revoke":
                 result = self.service.revoke(actor, role, int(parts[2]), body.get("reason", ""), body.get("effective_at"))
             elif len(parts) == 4 and parts[:2] == ["api", "credentials"] and parts[3] == "dispute":
